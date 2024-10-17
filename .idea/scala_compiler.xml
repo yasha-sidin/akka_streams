@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ScalaCompilerConfiguration">
-    <profile name="sbt 1" modules="cqs-akka-master_4540" />
+    <profile name="sbt 1" modules="akka_streams_375,cqs-akka-master_4540" />
     <profile name="sbt 2" modules="cqs-akka">
       <option name="deprecationWarnings" value="true" />
     </profile>

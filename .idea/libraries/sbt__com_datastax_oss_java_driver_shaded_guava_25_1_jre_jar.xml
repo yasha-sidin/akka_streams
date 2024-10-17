@@ -1,5 +1,5 @@
 <component name="libraryTable">
-  <library name="sbt: com.datastax.oss:java-driver-shaded-guava:25.1-jre:jar">
+  <library name="sbt: com.datastax.oss:java-driver-shaded-guava:25.1-jre:jar" external-system-id="SBT">
     <CLASSES>
       <root url="jar://$USER_HOME$/AppData/Local/Coursier/cache/v1/https/repo1.maven.org/maven2/com/datastax/oss/java-driver-shaded-guava/25.1-jre/java-driver-shaded-guava-25.1-jre.jar!/" />
     </CLASSES>
