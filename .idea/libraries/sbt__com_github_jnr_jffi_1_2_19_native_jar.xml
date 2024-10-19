@@ -1,5 +1,5 @@
 <component name="libraryTable">
-  <library name="sbt: com.github.jnr:jffi:1.2.19:native:jar">
+  <library name="sbt: com.github.jnr:jffi:1.2.19:native:jar" external-system-id="SBT">
     <CLASSES>
       <root url="jar://$USER_HOME$/AppData/Local/Coursier/cache/v1/https/repo1.maven.org/maven2/com/github/jnr/jffi/1.2.19/jffi-1.2.19-native.jar!/" />
     </CLASSES>
