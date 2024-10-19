@@ -6,14 +6,16 @@ import akka.persistence.cassandra.query.scaladsl.CassandraReadJournal
 import akka.persistence.query.{EventEnvelope, PersistenceQuery}
 import akka.persistence.typed.PersistenceId
 import akka.persistence.typed.scaladsl.{Effect, EventSourcedBehavior}
+import akka.stream.{ClosedShape, Graph}
 import akka.stream.alpakka.slick.scaladsl.{Slick, SlickSession}
-import akka.stream.scaladsl.{Flow, GraphDSL, Sink, Source}
+import akka.stream.scaladsl.{Broadcast, Flow, GraphDSL, RunnableGraph, Sink, Source, Zip}
 import akka.util.Timeout
 import akka_typed.TypedCalculatorWriteSide.{Add, Added, Command, Divide, Divided, Multiplied, Multiply}
 import scalikejdbc.DB.using
 import scalikejdbc.{ConnectionPool, ConnectionPoolSettings, DB}
-import akka_typed.CalculatorRepository.{getLatestOffsetAndResult, getSlickSession, insertionFromSource}
+import akka_typed.CalculatorRepository.{getInsertionSink, getLatestOffsetAndResult, getSlickSession, insertionFromSource}
 import akka_typed.{Supervisor, TypedCalculatorReadSide, TypedCalculatorWriteSide, persId}
+import org.slf4j.Logger
 import slick.jdbc.GetResult
 
 import java.util.UUID
@@ -136,42 +138,69 @@ object akka_typed {
     implicit val s: ActorSystem[SpawnProtocol.Command] = system
     implicit val session: SlickSession = slickSession
     implicit val ex: ExecutionContextExecutor = system.executionContext
-    getLatestOffsetAndResult.flatMap { entityOption =>
+
+    private def getJournal: Future[Source[EventEnvelope, NotUsed]] = getLatestOffsetAndResult.map { entityOption =>
       val startOffset = entityOption.map(_.writeSideOffset).getOrElse(0L)
       val readJournal: CassandraReadJournal = PersistenceQuery(system).readJournalFor[CassandraReadJournal](CassandraReadJournal.Identifier)
-      val source: Source[EventEnvelope, NotUsed] = readJournal.eventsByPersistenceId("001", startOffset, Long.MaxValue)
-      val entitySource = source
-        .map {
-          event =>
-            event.event match {
-              case Added(_, amount) =>
-                Await.result(getLatestOffsetAndResult.map { opt =>
-                  val lastRes = opt.map(_.calculatedValue).getOrElse(0.0)
-                  val newResult = lastRes + amount
-                  println(s"Log from Added: $newResult")
-                  CalculatorEntity(calculatedValue = newResult, writeSideOffset = event.sequenceNr)
-                }, 2 seconds)
-              case Multiplied(_, amount) =>
-                Await.result(getLatestOffsetAndResult.map { opt =>
-                  val lastRes = opt.map(_.calculatedValue).getOrElse(0.0)
-                  val newResult = lastRes * amount
-                  println(s"Log from Added: $newResult")
-                  CalculatorEntity(calculatedValue = newResult, writeSideOffset = event.sequenceNr)
-                }, 2 seconds)
-              case Divided(_, amount) =>
-                Await.result(getLatestOffsetAndResult.map { opt =>
-                  val lastRes = opt.map(_.calculatedValue).getOrElse(0.0)
-                  val newResult = lastRes / amount
-                  println(s"Log from Added: $newResult")
-                  CalculatorEntity(calculatedValue = newResult, writeSideOffset = event.sequenceNr)
-                }, 2 seconds)
-            }
-        }
+      readJournal.eventsByPersistenceId("001", startOffset + 1, Long.MaxValue)
+    }
+
+    def initJournalListening: Future[Done] = getJournal.flatMap { source =>
+      val entitySource = source.map { event => fromEventToEntity(event) }
       insertionFromSource(entitySource)
+    }
+
+    private def fromEventToEntity(event: EventEnvelope): CalculatorEntity = event.event match {
+      case Added(_, amount) =>
+        Await.result(getLatestOffsetAndResult.map { opt =>
+          val lastRes = opt.map(_.calculatedValue).getOrElse(0.0)
+          val newResult = lastRes + amount
+          println(s"Log from Added: $newResult")
+          CalculatorEntity(calculatedValue = newResult, writeSideOffset = event.sequenceNr)
+        }, 2 seconds)
+      case Multiplied(_, amount) =>
+        Await.result(getLatestOffsetAndResult.map { opt =>
+          val lastRes = opt.map(_.calculatedValue).getOrElse(0.0)
+          val newResult = lastRes * amount
+          println(s"Log from Multiplied: $newResult")
+          CalculatorEntity(calculatedValue = newResult, writeSideOffset = event.sequenceNr)
+        }, 2 seconds)
+      case Divided(_, amount) =>
+        Await.result(getLatestOffsetAndResult.map { opt =>
+          val lastRes = opt.map(_.calculatedValue).getOrElse(0.0)
+          val newResult = lastRes / amount
+          println(s"Log from Divided: $newResult")
+          CalculatorEntity(calculatedValue = newResult, writeSideOffset = event.sequenceNr)
+        }, 2 seconds)
+    }
+
+    def graphJournalListener(logger: Logger): Graph[ClosedShape.type, NotUsed] =
+      GraphDSL.create() { implicit builder: GraphDSL.Builder[NotUsed] =>
+        import GraphDSL.Implicits._
+
+        val input = builder.add(Await.result(getJournal, 2 seconds))
+
+        val transform = builder.add(Flow[EventEnvelope].map(fromEventToEntity))
+
+        val localOutput = builder.add(Sink.foreach[CalculatorEntity] { result =>
+          logger.info(s"New result: $result")
+        })
+
+        val dbOutput = builder.add(getInsertionSink)
+
+        val broadcast = builder.add(Broadcast[CalculatorEntity](2))
+
+        input.out ~> transform.in
+        transform.out ~> broadcast.in
+
+        broadcast.out(0) ~> localOutput.in
+        broadcast.out(1) ~> dbOutput.in
+
+        ClosedShape
     }
     /*
       // homework, spoiler
-        def updateState(event: Any, seqNum: Long): Result ={
+        def fromEventToEntity(event: Any, seqNum: Long): Result ={
           val newStste = event match {
             case Added(_amount)=>
               ???
@@ -187,7 +216,7 @@ object akka_typed {
           implicit builder: GraphDSL.Builder[NotUsed] =>
             //1.
             val input = builder.add(source)
-            val stateUpdater = builder.add(Flow[EventEnvelope].map(e=> updateState(e.event, e.sequenceNr)))
+            val stateUpdater = builder.add(Flow[EventEnvelope].map(e=> fromEventToEntity(e.event, e.sequenceNr)))
             val localSaveOutput = builder.add(Sink.foreach[Result]{
               r=>
                 latestCalculatedResult = r.state
@@ -225,6 +254,11 @@ object akka_typed {
       }
     }
 
+    def getInsertionSink(implicit slickSession: SlickSession): Sink[CalculatorEntity, Future[Done]] = {
+      import slickSession.profile.api._
+      Slick.sink((calc: CalculatorEntity) => sqlu"INSERT INTO public.result VALUES (${calc.id}, ${calc.calculatedValue},${calc.writeSideOffset})")
+    }
+
     def getLatestOffsetAndResult(implicit slickSession: SlickSession,
                                   actorSystem: ActorSystem[SpawnProtocol.Command]): Future[Option[CalculatorEntity]] = {
       import slickSession.profile.api._
@@ -245,13 +279,8 @@ object write {
       system.ask[ActorRef[Command]](SpawnProtocol.Spawn[Command](TypedCalculatorWriteSide(persId), "Calculator", Props.empty, _))
 
     calculatorRef.foreach { ref =>
-      ref ! Add(10)
-      ref ! Add(4)
-      ref ! Multiply(1848)
-      ref ! Divide(2)
-      ref ! Multiply(6655)
-      ref ! Add(1345)
-      ref ! Add(-798)
+      ref ! Multiply(10000)
+
     }
   }
 }
@@ -260,6 +289,18 @@ object synchronizeReadSideWithWrite {
   def main(args: Array[String]): Unit = {
     implicit val system: ActorSystem[SpawnProtocol.Command] = ActorSystem(Supervisor(), "CalculatorApp")
     implicit val session: SlickSession = getSlickSession
-    TypedCalculatorReadSide(system, session)
+    val readSide = TypedCalculatorReadSide(system, session)
+    readSide.initJournalListening
+  }
+}
+
+object graphTest {
+  def main(args: Array[String]): Unit = {
+    implicit val system: ActorSystem[SpawnProtocol.Command] = ActorSystem(Supervisor(), "CalculatorApp")
+    implicit val session: SlickSession = getSlickSession
+    val logger = system.log
+    val readSide = TypedCalculatorReadSide(system, session)
+    val graph = readSide.graphJournalListener(logger)
+    RunnableGraph.fromGraph(graph).run()
   }
 }
